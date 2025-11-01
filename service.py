@@ -4,11 +4,13 @@ import tempfile
 import zipfile
 import io
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from fastapi import UploadFile, File, Form
+from PyPDF2 import PdfReader
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from faker import Faker
@@ -23,6 +25,17 @@ class GenerateRequest(BaseModel):
     pages: int = 50  # pages per file
     mode: Literal["single", "separate", "zip"] = "zip"
     filename: Optional[str] = None  # desired filename for single output
+
+
+class FeedbackItem(BaseModel):
+    confidence: float
+    overridden: int | bool = 0
+    reviewer: Optional[str] = None
+
+
+class FeedbackRequest(BaseModel):
+    feedback: List[FeedbackItem]
+    previous_threshold: float = 0.95
 
 
 def generate_invoice_file(path: str, pages: int = 50) -> None:
@@ -141,6 +154,106 @@ def generate(req: GenerateRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/extract")
+async def extract_pdf(
+    file: UploadFile = File(...),
+    max_pages: int = Form(0),
+    max_words: int = Form(200),
+):
+    """Extract text from an uploaded PDF. Returns JSON with per-page text and full_text.
+
+    - file: uploaded PDF file (multipart/form-data)
+    - max_pages: optional form field to limit pages (0 = all)
+    """
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Uploaded file must be a PDF")
+
+    # read into memory (small PDFs expected). If large files are expected, stream to temp file.
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read PDF: {e}")
+
+    num_pages = len(reader.pages)
+    limit = num_pages if (max_pages <= 0 or max_pages > num_pages) else max_pages
+
+    pages_text = []
+    for i in range(limit):
+        try:
+            page = reader.pages[i]
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        pages_text.append(text)
+
+    full_text = "\n\n".join(pages_text)
+
+    # Truncate to first N words if requested
+    truncated = full_text
+    if max_words and max_words > 0:
+        words = full_text.split()
+        if len(words) > max_words:
+            truncated = " ".join(words[:max_words])
+
+    return {
+        "filename": file.filename,
+        "num_pages": num_pages,
+        "extracted_pages": limit,
+        "word_limit": max_words,
+        "text": truncated,
+        "pages": pages_text,
+        "full_text": full_text,
+    }
+
+
+@app.post("/feedback")
+def receive_feedback(req: FeedbackRequest):
+    """Accepts feedback with confidence scores and a previous threshold.
+
+    Decision logic:
+    - If any item has overridden truthy => accepted (override wins)
+    - Else if any item has confidence >= previous_threshold => accepted
+    - Else => rejected
+    Returns a summary including per-item evaluation.
+    """
+    if not req.feedback:
+        raise HTTPException(status_code=400, detail="feedback cannot be empty")
+
+    try:
+        override_used = any(bool(item.overridden) for item in req.feedback)
+        max_conf = max(float(item.confidence) for item in req.feedback)
+        meets_threshold = any(float(item.confidence) >= float(req.previous_threshold) for item in req.feedback)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
+
+    accepted = bool(override_used or meets_threshold)
+    reason = "override" if override_used else ("meets_threshold" if meets_threshold else "below_threshold")
+
+    details = [
+        {
+            "reviewer": item.reviewer,
+            "confidence": float(item.confidence),
+            "overridden": bool(item.overridden),
+            "meets_threshold": float(item.confidence) >= float(req.previous_threshold),
+        }
+        for item in req.feedback
+    ]
+
+    return {
+        "accepted": accepted,
+        "reason": reason,
+        "used_override": override_used,
+        "previous_threshold": float(req.previous_threshold),
+        "max_confidence": round(max_conf, 4),
+        "meets_threshold": meets_threshold,
+        "details": details,
+    }
 
 
 if __name__ == "__main__":
